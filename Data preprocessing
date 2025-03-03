@@ -1,0 +1,64 @@
+#Data preprocessing
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+'''
+#Multicollinearity detection image - heat map
+# Replace 'your_file.xlsx' with the correct file path
+data = pd.read_excel('your_file.xlsx')
+
+# 选择自变量
+independent_variables = [
+    'POI', 'NDVI', 'subway station', 'bus station', 'population density',
+    'water', 'green land', 'building height', 'building density',
+    'Plot ratio', 'Proportion of residential areas', 'Proportion of commercial areas',
+    'Proportion of industrial areas',  'Green buffer zone',
+    'Road network density','Water buffer zone'
+]
+
+# Get a subset of the independent variables
+data_subset = data[independent_variables]
+
+# Calculate the correlation matrix
+correlation_matrix = data_subset.corr()
+
+# Set the size of the image
+plt.figure(figsize=(8, 8))
+
+# Draw a heat map
+sns.heatmap(correlation_matrix, annot=True, fmt='.2f', square=True, cmap='coolwarm', xticklabels=independent_variables, yticklabels=independent_variables)
+
+# Display the graph
+plt.show()
+'''
+#VIF variance test
+'''
+import pandas as pd
+import geopandas as gpd
+from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import numpy as np
+import joblib
+
+data = pd.read_excel('D:\Desktop\\beijing LST data.xls')
+
+
+feature_cols = [
+    'POI', 'NDVI', 'subway station', 'bus station', 'population density',
+    'water', 'green land', 'building height', 'building density',
+    'Plot ratio', 'Proportion of residential areas', 'Proportion of commercial areas',
+    'Proportion of industrial areas', 'Green buffer zone',
+    'Road network density', 'Water buffer zone'
+]
+
+X = data[feature_cols]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Calculate VIF
+vif_data = pd.DataFrame()
+vif_data["feature"] = X.columns
+vif_data["VIF"] = [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]
+
+print(vif_data)
