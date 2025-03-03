@@ -1,0 +1,262 @@
+
+import pandas as pd
+import geopandas as gpd
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
+from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor, StackingRegressor, VotingRegressor
+import libpysal as lps
+import spreg
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+import optuna
+from optuna.samplers import TPESampler
+from sklearn.inspection import PartialDependenceDisplay
+
+# Read data from Excel file
+data = pd.read_excel('')
+# Create a geographic data frame
+gdf = gpd.GeoDataFrame(data, geometry=gpd.points_from_xy(data['Longitude'], data['Latitude']))
+gdf.crs = 'epsg:4326' # Set the original coordinate reference system to WGS84
+gdf = gdf.to_crs(epsg=4479) # Convert to Beijing's zigzag coordinate system
+
+# Create a spatial weight matrix
+W = lps.weights.DistanceBand.from_dataframe(gdf, threshold=1000, binary=True, silence_warnings=True)
+
+feature_cols = [
+    'POI', 'NDVI', 'subway station', 'bus station', 'population density',
+    'water', 'green land', 'building height', 'building density',
+    'Plot ratio', 'Proportion of residential areas', 'Proportion of commercial areas',
+    'Proportion of industrial areas', 'Green buffer zone',
+    'Road network density', 'Water buffer zone'
+]
+
+X = data[feature_cols].values
+y = data['LST'].values
+
+sem_model = spreg.ML_Error(y, X, w=W, name_x=feature_cols, name_y='LST')
+
+data['spatial_error'] = sem_model.u
+
+X_combined = pd.concat([data[feature_cols], data[['spatial_error']]], axis=1)
+
+X_train_combined, X_test_combined, y_train, y_test = train_test_split(X_combined, data['LST'], test_size=0.2, random_state=42)
+
+scaler = StandardScaler()
+X_train_combined_scaled = scaler.fit_transform(X_train_combined)
+X_test_combined_scaled = scaler.transform(X_test_combined)
+
+# Define the model to test
+models = {
+    'CatBoost': CatBoostRegressor(verbose=0),
+    'XGBoost': XGBRegressor(),
+    'GradientBoosting': GradientBoostingRegressor(),
+    'HistGradientBoosting': HistGradientBoostingRegressor()
+}
+
+#Call the model's parameter optimization method
+best_estimators = []
+for model_name, model in models.items():
+    print(f'\nCalling model: {model_name}')
+
+    def objective(trial):
+        if model_name == 'CatBoost':
+            param = {
+                'iterations': trial.suggest_int('iterations', 100, 1000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'depth': trial.suggest_int('depth', 3, 8),
+                'l2_leaf_reg': trial.suggest_int('l2_leaf_reg', 1, 10)
+            }
+            model = CatBoostRegressor(verbose=0, **param)
+        elif model_name == 'XGBoost':
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 3, 8)
+            }
+            model = XGBRegressor(**param)
+        elif model_name == 'GradientBoosting':
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 3, 8)
+            }
+            model = GradientBoostingRegressor(**param)
+        elif model_name == 'HistGradientBoosting':
+            param = {
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_iter': trial.suggest_int('max_iter', 100, 1000),
+                'max_depth': trial.suggest_int('max_depth', 3, 8)
+            }
+            model = HistGradientBoostingRegressor(**param)
+        else:
+            param = {}
+            model = None
+
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('model', model)
+        ])
+
+       # Perform cross validation to evaluate model stability
+        scores = cross_val_score(pipeline, X_train_combined_scaled, y_train, scoring='neg_mean_squared_error', cv=5)
+        return -np.mean(scores)
+
+    study = optuna.create_study(direction='minimize', sampler=TPESampler())
+    study.optimize(objective, n_trials=50)
+
+ # Use the optimized parameters to train the model and add an early stopping mechanism
+    best_params = study.best_params
+    best_model = model.set_params(**best_params)
+    if model_name in ['CatBoost', 'XGBoost']:
+        best_model.fit(
+            X_train_combined_scaled, y_train,
+            early_stopping_rounds=10,
+            eval_set=[(X_test_combined_scaled, y_test)],
+            verbose=10
+        )
+    else:
+        best_model.fit(X_train_combined_scaled, y_train)
+
+    best_estimators.append((model_name, best_model))
+
+# Create an integrated method for Stacking and Voting
+stacking_regressor = StackingRegressor(estimators=best_estimators, final_estimator=Ridge(), cv=3)
+voting_regressor = VotingRegressor(estimators=best_estimators)
+
+# Train Stacking and Voting models on the training set
+stacking_regressor.fit(X_train_combined_scaled, y_train)
+voting_regressor.fit(X_train_combined_scaled, y_train)
+
+y_pred_stacking = stacking_regressor.predict(X_test_combined_scaled)
+y_pred_voting = voting_regressor.predict(X_test_combined_scaled)
+
+mse_stacking = mean_squared_error(y_test, y_pred_stacking)
+rmse_stacking = np.sqrt(mse_stacking)
+r2_stacking = r2_score(y_test, y_pred_stacking)
+mae_stacking = mean_absolute_error(y_test, y_pred_stacking)
+
+mse_voting = mean_squared_error(y_test, y_pred_voting)
+rmse_voting = np.sqrt(mse_voting)
+r2_voting = r2_score(y_test, y_pred_voting)
+mae_voting = mean_absolute_error(y_test, y_pred_voting)
+
+print(f'Stacking model R²: {r2_stacking:.4f}')
+print(f'Stacking model Mean Square Error (MSE): {mse_stacking:.4f}')
+print(f'Stacking model Root Mean Square Error (RMSE): {rmse_stacking:.4f}')
+print(f'Stacking model Mean Absolute Error (MAE): {mae_stacking:.4f}')
+
+print(f'Voting model R²: {r2_voting:.4f}')
+print(f'Voting model Mean Square Error (MSE): {mse_voting:.4f}')
+print(f'Voting model Root Mean Square Error (RMSE): {rmse_voting:.4f}')
+print(f'Voting model Mean Absolute Error (MAE): {mae_voting:.4f}')
+
+
+# Explain the best base learner (select the best model based on the validation set)
+best_model_name, best_model = max(best_estimators, key=lambda item: item[1].score(X_test_combined_scaled, y_test))
+
+print(f'\nThe best base learner is: {best_model_name}')
+
+# Use SHAP to analyze the best base learner
+explainer = shap.Explainer(best_model, X_train_combined_scaled)
+shap_values = explainer(X_train_combined_scaled)
+
+# Draw SHAP summary plot
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_train_combined, feature_names=X_combined.columns, show=False)
+plt.title(f'SHAP Summary Plot for {best_model_name}')
+plt.show()
+
+# Draw feature importance plot (with percentage values)
+feature_importances = np.mean(np.abs(shap_values.values), axis=0)
+total_importance = np.sum(feature_importances)
+feature_importance_percent = [(name, importance / total_importance * 100) for name, importance in zip(X_combined.columns, feature_importances)]
+
+plt.figure(figsize=(25, 8))
+names, importances = zip(*sorted(feature_importance_percent, key=lambda x: x[1], reverse=True))
+plt.barh(names[:6], importances[:6], color='skyblue')
+for index, value in enumerate(importances[:6]):
+    plt.text(value + 0.5, index, f'{value:.2f}%', va='center')
+plt.xlabel('Importance (%)')
+plt.title(f'Top 6 Feature Importance (Percentage) for {best_model_name}')
+plt.gca().invert_yaxis()
+plt.grid(axis='x')
+plt.show()
+
+# Extract the top 6 features with the highest feature importance
+top_6_features = [name for name, _ in sorted(feature_importance_percent, key=lambda x: x[1], reverse=True)[:6]]
+top_6_indices = [list(X_combined.columns).index(name) for name in top_6_features]
+
+# Draw PDP graph
+fig, ax = plt.subplots(figsize=(12, 8))
+PartialDependenceDisplay.from_estimator(best_model, X_train_combined_scaled, features=top_6_indices, feature_names=X_combined.columns, ax=ax)
+plt.suptitle(f'Partial Dependence Plot (PDP) for Top 6 Important Features ({best_model_name})')
+plt.show()
+
+# Draw an ICE graph (individual conditional expectation graph) to explain the original features
+for feature in top_6_indices:
+    plt.figure(figsize=(12, 8))
+    shap.dependence_plot(feature, shap_values, X_train_combined, feature_names=X_combined.columns)
+    plt.title(f'ICE Plot for Feature: {X_combined.columns[feature]} ({best_model_name})')
+    plt.show()
+
+
+'''
+#Learning curve, residual and other calculations
+from sklearn.model_selection import learning_curve
+import seaborn as sns
+
+def plot_learning_curve(estimator, X, y, cv, title):
+    train_sizes, train_scores, test_scores = learning_curve(estimator, X, y, cv=cv, scoring='r2', n_jobs=-1,
+                                                            train_sizes=np.linspace(0.1, 1.0, 10))
+    train_scores_mean = np.mean(train_scores, axis=1)
+    test_scores_mean = np.mean(test_scores, axis=1)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_sizes, train_scores_mean, 'o-', color="r", label="Training score")
+    plt.plot(train_sizes, test_scores_mean, 'o-', color="g", label="Cross-validation score")
+    plt.xlabel("Training Examples")
+    plt.ylabel("R² Score")
+    plt.title(title)
+    plt.legend(loc="best")
+    plt.grid()
+    plt.show()
+
+def plot_residuals(y_true, y_pred, title):
+    residuals = y_true - y_pred
+    plt.figure(figsize=(10, 6))
+    sns.histplot(residuals, kde=True)
+    plt.xlabel("Residuals")
+    plt.ylabel("Frequency")
+    plt.title(title)
+    plt.grid()
+    plt.show()
+
+
+# Calculate the cross-validation R² average function
+def cross_val_r2(estimator, X, y, cv):
+    r2_scores = cross_val_score(estimator, X, y, scoring='r2', cv=cv)
+    return np.mean(r2_scores)
+
+# Plot learning curves, residual plots, and calculate cross-validation R² averages for ensemble models (Stacking and Voting)
+ensemble_models = {
+    'Stacking Regressor': stacking_regressor,
+    'Voting Regressor': voting_regressor
+}
+for model_name, ensemble_model in ensemble_models.items():
+    print(f'\nEnsemble model: {model_name}')
+# Plot learning curve
+plot_learning_curve(ensemble_model, X_train_combined_scaled, y_train, cv=5, title=f'{model_name} Learning Curve')
+
+# Calculate and print cross-validation R² mean
+r2_cv_mean = cross_val_r2(ensemble_model, X_train_combined_scaled, y_train, cv=5)
+print(f'{model_name} cross-validation R² mean: {r2_cv_mean:.4f}')
+
+# Plot residual graph
+    y_pred = ensemble_model.predict(X_test_combined_scaled)
+    plot_residuals(y_test, y_pred, title=f'{model_name} Residuals Distribution')
