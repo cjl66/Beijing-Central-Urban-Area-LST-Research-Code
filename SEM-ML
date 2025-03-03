@@ -1,0 +1,119 @@
+#catboost - spatial error
+
+'''
+import pandas as pd
+import geopandas as gpd
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from catboost import CatBoostRegressor
+import libpysal as lps
+import spreg
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+from pathlib import Path
+import matplotlib.cm as cm
+import seaborn as sns
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import learning_curve
+
+
+# Read data from Excel file
+data = pd.read_excel('')
+
+# Create a geographic data frame
+gdf = gpd.GeoDataFrame(data, geometry=gpd.points_from_xy(data['Longitude'], data['Latitude']))
+gdf.crs = 'epsg:4326' # Set the original coordinate reference system to WGS84
+gdf = gdf.to_crs(epsg=4479) # Convert to Beijing's projection coordinate system
+
+# Create spatial weight matrix
+W = lps.weights.DistanceBand.from_dataframe(gdf, threshold=1000, binary=True, silence_warnings=True)
+
+feature_cols = [
+    'POI', 'NDVI', 'subway station', 'bus station', 'population density',
+    'water', 'green land', 'building height', 'building density',
+    'Plot ratio', 'Proportion of residential areas', 'Proportion of commercial areas',
+    'Proportion of industrial areas', 'Green buffer zone',
+    'Road network density', 'Water buffer zone'
+]
+
+X = data[feature_cols].values
+y = data['LST'].values
+
+# Create a SEM model to calculate the residuals
+sem_model = spreg.ML_Error(y, X, w=W, name_x=feature_cols, name_y='LST')
+
+data['spatial_error'] = sem_model.u
+
+X_combined = pd.concat([data[feature_cols], data[['spatial_error']]], axis=1)
+
+X_train_combined, X_test_combined, y_train, y_test = train_test_split(X_combined, data['LST'], test_size=0.1, random_state=42)
+
+scaler = StandardScaler()
+X_train_combined_scaled = scaler.fit_transform(X_train_combined)
+X_test_combined_scaled = scaler.transform(X_test_combined)
+
+param_grid = {
+    'iterations': [100, 200, 300],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'depth': [3, 4, 6, 8],
+    'l2_leaf_reg': [1, 3, 5, 7, 9]
+}
+
+cb_reg = CatBoostRegressor(verbose=0)  # 设置verbose=0以减少日志输出
+
+random_search = RandomizedSearchCV(estimator=cb_reg, param_distributions=param_grid, n_iter=100,
+                                   scoring='neg_mean_squared_error', cv=3, verbose=2, random_state=42, n_jobs=-1)
+random_search.fit(X_train_combined_scaled, y_train)
+
+# Output the best parameters
+print("Best parameters:", random_search.best_params_)
+
+# Use the best model for prediction
+y_pred = random_search.predict(X_test_combined_scaled)
+
+# Evaluate model performance
+# Calculate MSE
+mse = mean_squared_error(y_test, y_pred)
+# Calculate RMSE
+rmse = np.sqrt(mse)
+# Calculate MAE
+mae = mean_absolute_error(y_test, y_pred)
+# Calculate R²
+r2 = r2_score(y_test, y_pred)
+
+# Output performance indicators
+print(f'Optimized R²: {r2:.4f}')
+print(f'Optimized mean square error (MSE): {mse:.4f}')
+print(f'Optimized root mean square error (RMSE): {rmse:.4f}')
+print(f'Optimized mean absolute error (MAE): {mae:.4f}')
+'''
+'''
+# Check if there is overfitting
+# 1. Cross validation
+cross_val_scores = cross_val_score(random_search.best_estimator_, X_train_combined_scaled, y_train, cv=5, scoring='r2')
+print(f'Cross validation R² score: {cross_val_scores}')
+print(f'Cross validation R² score mean: {cross_val_scores.mean():.4f}')
+print(f'Cross validation R² score standard deviation: {cross_val_scores.std():.4f}')
+
+# 2. Learning curve
+train_sizes, train_scores, test_scores = learning_curve(random_search.best_estimator_, X_train_combined_scaled, y_train, cv=5, scoring='neg_mean_squared_error', n_jobs=-1, train_sizes=np.linspace(0.1, 1.0, 10))
+
+# Calculate the mean and standard deviation of the training and test errors
+train_scores_mean = -train_scores.mean(axis=1)
+train_scores_std = train_scores.std(axis=1)
+test_scores_mean = -test_scores.mean(axis=1)
+test_scores_std = test_scores.std(axis=1)
+
+plt.figure(figsize=(10, 6))
+plt.plot(train_sizes, train_scores_mean, 'o-', color='r', label='Training error')
+plt.plot(train_sizes, test_scores_mean, 'o-', color='g', label='Validation error')
+plt.fill_between(train_sizes, train_scores_mean - train_scores_std, train_scores_mean + train_scores_std, alpha=0.1, color='r')
+plt.fill_between(train_sizes, test_scores_mean - test_scores_std, test_scores_mean + test_scores_std, alpha=0.1, color='g')
+plt.title('Learning Curve')
+plt.xlabel('Training Size')
+plt.ylabel('Mean Squared Error')
+plt.legend(loc='best')
+plt.grid()
+plt.show()
